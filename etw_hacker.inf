@@ -1,0 +1,62 @@
+;
+; etw_hacker.inf
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System ; TODO: specify appropriate Class
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318} ; TODO: specify appropriate ClassGuid
+Provider    = %ManufacturerName%
+CatalogFile = etw_hacker.cat
+DriverVer   = ; TODO: set DriverVer in stampinf property pages
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+etw_hacker.sys = 1,,
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299 ; %13% support introduced in build 16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%etw_hacker.DeviceDesc% = etw_hacker_Device, Root\etw_hacker ; TODO: edit hw-id
+
+[etw_hacker_Device.NT]
+CopyFiles = File_Copy
+
+[File_Copy]
+etw_hacker.sys
+
+;-------------- Service installation
+[etw_hacker_Device.NT.Services]
+AddService = etw_hacker,%SPSVCINST_ASSOCSERVICE%, etw_hacker_Service_Inst
+
+; -------------- etw_hacker driver install sections
+[etw_hacker_Service_Inst]
+DisplayName    = %etw_hacker.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\etw_hacker.sys
+
+[etw_hacker_Device.NT.Wdf]
+KmdfService = etw_hacker, etw_hacker_wdfsect
+
+[etw_hacker_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName = "<Your manufacturer name>" ;TODO: Replace with your manufacturer name
+DiskName = "etw_hacker Installation Disk"
+etw_hacker.DeviceDesc = "etw_hacker Device"
+etw_hacker.SVCDESC = "etw_hacker Service"
